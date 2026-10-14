@@ -53,6 +53,7 @@ export interface GpuContact {
 const finite = (x: number): number => (x === Infinity ? BIG : x === -Infinity ? -BIG : x);
 const groups = (n: number): number => Math.ceil(n / WORKGROUP_SIZE);
 const pow2AtLeast = (n: number): number => 2 ** Math.ceil(Math.log2(Math.max(n, 2)));
+const log2 = (x: number): number => Math.min(31, Math.max(0, Math.round(Math.log2(x))));
 
 /** Byte size of a body buffer holding `n` bodies. */
 export const bodyBufferSize = (n: number): number => Math.max(n, 1) * BODY_FLOATS * 4;
@@ -441,6 +442,15 @@ export class GpuSolver3D {
   private stepCount = 0;
   private passBuffer: GPUBuffer | null = null;
   private passEntries = 0;
+  // A step's uploads are written into these and copied out by writeBuffer, so it allocates none
+  private readonly paramData = new ArrayBuffer(PARAM_WORDS * 4);
+  private readonly paramF32 = new Float32Array(this.paramData);
+  private readonly paramU32 = new Uint32Array(this.paramData);
+  private passData = new ArrayBuffer(0);
+  private passU32 = new Uint32Array(0);
+  private passF32 = new Float32Array(0);
+  /** The pass-constant bind group's one dynamic offset */
+  private readonly passOffset = new Uint32Array(1);
 
   /** Which contact buffer this step writes (the other holds last step's contacts). */
   private parity = 0;
@@ -1213,9 +1223,8 @@ export class GpuSolver3D {
   private writeParams(): void {
     const p = this.params;
     const cap = this.bodyCapacity;
-    const buf = new ArrayBuffer(PARAM_WORDS * 4);
-    const f = new Float32Array(buf);
-    const u = new Uint32Array(buf);
+    const f = this.paramF32;
+    const u = this.paramU32;
     f[0] = p.dt;
     f[1] = p.gravity;
     f[2] = p.betaLin;
@@ -1247,11 +1256,17 @@ export class GpuSolver3D {
     u[28] = this.colorRounds;
     u[29] = this.manifoldCapacity;
     u[30] = this.stepCount;
-    const log2 = (x: number) => Math.min(31, Math.max(0, Math.round(Math.log2(x))));
     u[31] = log2(this.primalLanes[0]) | (log2(this.primalLanes[1]) << 8) | (log2(this.primalLanes[2]) << 16);
-    f.set([p.windSpeed * Math.cos(p.windAngle), p.windSpeed * Math.sin(p.windAngle), 0, p.windPressure, p.windGust], 32);
-    f.set([p.up[0], p.up[1], p.up[2], 0], 40);
-    this.device.queue.writeBuffer(this.paramsBuffer, 0, buf);
+    f[32] = p.windSpeed * Math.cos(p.windAngle);
+    f[33] = p.windSpeed * Math.sin(p.windAngle);
+    f[34] = 0;
+    f[35] = p.windPressure;
+    f[36] = p.windGust;
+    f[40] = p.up[0];
+    f[41] = p.up[1];
+    f[42] = p.up[2];
+    f[43] = 0;
+    this.device.queue.writeBuffer(this.paramsBuffer, 0, this.paramData);
   }
 
   /** Pass constants: per iteration, one entry per colour (primal), then one for the dual. */
@@ -1265,9 +1280,20 @@ export class GpuSolver3D {
       this.passEntries = entries;
       this.passGroup = this.device.createBindGroup({ layout: this.layouts.pass, entries: [{ binding: 0, resource: { buffer: this.passBuffer, size: 16 } }] });
     }
-    const data = new ArrayBuffer(entries * PASS_STRIDE);
-    const u32 = new Uint32Array(data);
-    const f32 = new Float32Array(data);
+    const bytes = entries * PASS_STRIDE;
+    if (bytes > this.passData.byteLength) {
+      this.passData = new ArrayBuffer(bytes);
+      this.passU32 = new Uint32Array(this.passData);
+      this.passF32 = new Float32Array(this.passData);
+    }
+    const u32 = this.passU32;
+    const f32 = this.passF32;
+    // Only an entry's first two words are ever set, so the rest stay zero; with no iterations
+    // the one entry is all zero
+    if (iterations === 0) {
+      u32[0] = 0;
+      f32[1] = 0;
+    }
     for (let it = 0; it < iterations; it++) {
       for (let col = 0; col <= this.colorCap; col++) {
         const w = ((it * perIteration + col) * PASS_STRIDE) / 4;
@@ -1275,7 +1301,26 @@ export class GpuSolver3D {
         f32[w + 1] = alpha;
       }
     }
-    this.device.queue.writeBuffer(this.passBuffer!, 0, data);
+    this.device.queue.writeBuffer(this.passBuffer!, 0, this.passData, 0, bytes);
+  }
+
+  /** Bind pass-constant entry `entry` (group 1 at a dynamic offset). */
+  private setPass(pass: GPUComputePassEncoder, entry: number): void {
+    this.passOffset[0] = entry * PASS_STRIDE;
+    pass.setBindGroup(1, this.passGroup!, this.passOffset, 0, 1);
+  }
+
+  private run(pass: GPUComputePassEncoder, name: string, group: GPUBindGroup, x: number): void {
+    if (x <= 0) return;
+    pass.setPipeline(this.pipes[name]);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(x);
+  }
+
+  private runIndirect(pass: GPUComputePassEncoder, name: string, group: GPUBindGroup, argsWord: number): void {
+    pass.setPipeline(this.pipes[name]);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroupsIndirect(this.argsBuffer, argsWord * 4);
   }
 
   step(): void {
@@ -1312,60 +1357,48 @@ export class GpuSolver3D {
       phase++;
     };
     const G = this.groups;
-    const run = (name: string, group: GPUBindGroup, x: number) => {
-      if (x <= 0) return;
-      pass.setPipeline(this.pipes[name]);
-      pass.setBindGroup(0, group);
-      pass.dispatchWorkgroups(x);
-    };
-    const runIndirect = (name: string, group: GPUBindGroup, argsWord: number) => {
-      pass.setPipeline(this.pipes[name]);
-      pass.setBindGroup(0, group);
-      pass.dispatchWorkgroupsIndirect(this.argsBuffer, argsWord * 4);
-    };
 
     // Collision
     beginPhase();
-    run('beginFrame', G.broad, 1);
-    if (p.reuseContacts) run('updateRefs', G.refs, groups(N));
-    run('argsPrev', G.args, 1);
-    runIndirect('hashInsert', G.contacts[cur], IA_PREV);
-    run('gridCount', G.broad, groups(N));
+    this.run(pass, 'beginFrame', G.broad, 1);
+    if (p.reuseContacts) this.run(pass, 'updateRefs', G.refs, groups(N));
+    this.run(pass, 'argsPrev', G.args, 1);
+    this.runIndirect(pass, 'hashInsert', G.contacts[cur], IA_PREV);
+    this.run(pass, 'gridCount', G.broad, groups(N));
     this.gridScan.encode(pass);
-    run('gridScatter', G.broad, groups(N));
-    run('findPairs', G.broad, groups(N));
-    run('argsPairs', G.args, 1);
-    runIndirect('narrowphase', G.contacts[cur], IA_PAIRS);
-    run('argsContacts', G.args, 1);
+    this.run(pass, 'gridScatter', G.broad, groups(N));
+    this.run(pass, 'findPairs', G.broad, groups(N));
+    this.run(pass, 'argsPairs', G.args, 1);
+    this.runIndirect(pass, 'narrowphase', G.contacts[cur], IA_PAIRS);
+    this.run(pass, 'argsContacts', G.args, 1);
 
     // Adjacency
     beginPhase();
-    run('degreeJoints', G.topo[cur], groups(J));
-    runIndirect('degreeContacts', G.topo[cur], IA_CONTACTS);
+    this.run(pass, 'degreeJoints', G.topo[cur], groups(J));
+    this.runIndirect(pass, 'degreeContacts', G.topo[cur], IA_CONTACTS);
     this.adjScan!.encode(pass);
-    run('fillJoints', G.topo[cur], groups(J));
-    runIndirect('fillContacts', G.topo[cur], IA_CONTACTS);
-    run('sortAdjacency', G.topo[cur], groups(N));
+    this.run(pass, 'fillJoints', G.topo[cur], groups(J));
+    this.runIndirect(pass, 'fillContacts', G.topo[cur], IA_CONTACTS);
+    this.run(pass, 'sortAdjacency', G.topo[cur], groups(N));
 
     // Colouring
     beginPhase();
     if (!this.fixedColors) {
-      run('colorCompact', G.topo[cur], groups(N));
-      run('colorMark', G.topo[cur], groups(N));
-      for (let r = 0; r < this.colorRounds; r++) run(r % 2 === 0 ? 'colorRoundAB' : 'colorRoundBA', G.topo[cur], groups(N));
+      this.run(pass, 'colorCompact', G.topo[cur], groups(N));
+      this.run(pass, 'colorMark', G.topo[cur], groups(N));
+      for (let r = 0; r < this.colorRounds; r++) this.run(pass, r % 2 === 0 ? 'colorRoundAB' : 'colorRoundBA', G.topo[cur], groups(N));
     }
-    run('colorCount', G.topo[cur], this.colorGroups);
+    this.run(pass, 'colorCount', G.topo[cur], this.colorGroups);
     this.colorHistScan.encode(pass);
-    run('colorStarts', G.topo[cur], 1);
-    run('argsColors', G.args, 1);
-    run('colorScatter', G.topo[cur], this.colorGroups);
+    this.run(pass, 'colorStarts', G.topo[cur], 1);
+    this.run(pass, 'argsColors', G.args, 1);
+    this.run(pass, 'colorScatter', G.topo[cur], this.colorGroups);
 
     // Solve
     beginPhase();
     const perIteration = this.colorCap + 1;
-    const setPass = (entry: number) => pass.setBindGroup(1, this.passGroup!, [entry * PASS_STRIDE]);
     pass.setBindGroup(0, G.solve[cur]);
-    setPass(0);
+    this.setPass(pass, 0);
     if (J > 0) {
       pass.setPipeline(this.pipes.warmStartJoints);
       pass.dispatchWorkgroups(groups(J));
@@ -1375,10 +1408,10 @@ export class GpuSolver3D {
     for (let it = 0; it < p.iterations; it++) {
       pass.setPipeline(this.pipes.primal);
       for (let col = 0; col < this.colorCap; col++) {
-        setPass(it * perIteration + col);
+        this.setPass(pass, it * perIteration + col);
         pass.dispatchWorkgroupsIndirect(this.argsBuffer, (IA_COLOR + 3 * col) * 4);
       }
-      setPass(it * perIteration + this.colorCap);
+      this.setPass(pass, it * perIteration + this.colorCap);
       pass.setPipeline(this.pipes.dual);
       pass.dispatchWorkgroupsIndirect(this.argsBuffer, IA_CONSTRAINTS * 4);
     }
